@@ -94,9 +94,9 @@ Routes use hashbang URLs:
 
 ## Frontend Stack
 
+- **Vue 3** (CDN) - Reactive UI with hashbang routing
 - **Tailwind CSS** (CDN) - Utility-first styling
 - **Lucide Icons** (CDN) - Icon library
-- **Vanilla JS** - No framework dependency
 
 ## Comparison with Go Versions
 
