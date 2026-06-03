@@ -12,8 +12,13 @@ use std::time::Instant;
 
 // ─── Embedded UI Files ──────────────────────────────────────────
 const INDEX_HTML: &str = include_str!("../ui/index.html");
-const APP_JS: &str = include_str!("../ui/app.js");
+const APP_JS: &str = include_str!("../ui/js/app.js");
 const STYLES_CSS: &str = include_str!("../ui/css/styles.css");
+const COMPONENTS_APP_LAYOUT: &str = include_str!("../ui/js/components/AppLayout.js");
+const COMPONENTS_SIDEBAR: &str = include_str!("../ui/js/components/Sidebar.js");
+const COMPONENTS_STATUS_CARD: &str = include_str!("../ui/js/components/StatusCard.js");
+const VIEWS_DASHBOARD: &str = include_str!("../ui/js/views/Dashboard.js");
+const VIEWS_SETTINGS: &str = include_str!("../ui/js/views/Settings.js");
 
 // ─── CLI ────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -73,10 +78,50 @@ async fn serve_app_js() -> Response {
         .into_response()
 }
 
-async fn serve_css() -> Response {
+async fn serve_styles_css() -> Response {
     (
         [("content-type", "text/css")],
         STYLES_CSS,
+    )
+        .into_response()
+}
+
+async fn serve_component_app_layout() -> Response {
+    (
+        [("content-type", "application/javascript")],
+        COMPONENTS_APP_LAYOUT,
+    )
+        .into_response()
+}
+
+async fn serve_component_sidebar() -> Response {
+    (
+        [("content-type", "application/javascript")],
+        COMPONENTS_SIDEBAR,
+    )
+        .into_response()
+}
+
+async fn serve_component_status_card() -> Response {
+    (
+        [("content-type", "application/javascript")],
+        COMPONENTS_STATUS_CARD,
+    )
+        .into_response()
+}
+
+async fn serve_view_dashboard() -> Response {
+    (
+        [("content-type", "application/javascript")],
+        VIEWS_DASHBOARD,
+    )
+        .into_response()
+}
+
+async fn serve_view_settings() -> Response {
+    (
+        [("content-type", "application/javascript")],
+        VIEWS_SETTINGS,
     )
         .into_response()
 }
@@ -128,8 +173,13 @@ async fn main() {
 
             let app = Router::new()
                 .route("/", get(serve_index))
-                .route("/app.js", get(serve_app_js))
-                .route("/css/styles.css", get(serve_css))
+                .route("/css/styles.css", get(serve_styles_css))
+                .route("/js/app.js", get(serve_app_js))
+                .route("/js/components/AppLayout.js", get(serve_component_app_layout))
+                .route("/js/components/Sidebar.js", get(serve_component_sidebar))
+                .route("/js/components/StatusCard.js", get(serve_component_status_card))
+                .route("/js/views/Dashboard.js", get(serve_view_dashboard))
+                .route("/js/views/Settings.js", get(serve_view_settings))
                 .route("/api/status", get(serve_status))
                 .route("/api/health", get(serve_health))
                 .with_state(state);
