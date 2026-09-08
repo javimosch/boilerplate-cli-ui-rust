@@ -1,219 +1,198 @@
-use axum::{
-    extract::State,
-    response::{Html, IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
-use clap::{Parser, Subcommand};
-use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use std::time::Instant;
+//! A Rust CLI with an embedded web UI.
+//!
+//! The command surface follows the agent-first CLI specs
+//! (https://cli-specs.intrane.fr):
+//!
+//! - `cli-output-spec`  data on stdout, context on stderr, exit codes 80-119,
+//!   typed errors, `help-json`
+//! - `cli-guide-spec`   `guide`, embedded in the binary
+//! - `cli-daemon-spec`  `serve --host --port`, `/_health`, `/_shutdown`,
+//!   `daemon start|stop|status`
 
-// ─── Embedded UI Files ──────────────────────────────────────────
-const INDEX_HTML: &str = include_str!("../ui/index.html");
-const APP_JS: &str = include_str!("../ui/js/app.js");
-const STYLES_CSS: &str = include_str!("../ui/css/styles.css");
-const COMPONENTS_APP_LAYOUT: &str = include_str!("../ui/js/components/AppLayout.js");
-const COMPONENTS_SIDEBAR: &str = include_str!("../ui/js/components/Sidebar.js");
-const COMPONENTS_STATUS_CARD: &str = include_str!("../ui/js/components/StatusCard.js");
-const VIEWS_DASHBOARD: &str = include_str!("../ui/js/views/Dashboard.js");
-const VIEWS_SETTINGS: &str = include_str!("../ui/js/views/Settings.js");
+mod daemon;
+mod guide;
+mod server;
 
-// ─── CLI ────────────────────────────────────────────────────────
-#[derive(Parser)]
-#[command(name = "boilerplate-cli-ui-rust")]
-#[command(about = "Rust CLI with embedded web UI")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+use std::process::exit;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const TOOL: &str = "boilerplate-cli-ui-rust";
+
+// Semantic exit codes (cli-output-spec §2).
+pub const EXIT_MISSING_ARG: i32 = 80;
+pub const EXIT_UNKNOWN_COMMAND: i32 = 85;
+pub const EXIT_PRECONDITION: i32 = 90;
+pub const EXIT_EXTERNAL: i32 = 100;
+pub const EXIT_INTERNAL: i32 = 110;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        print_help();
+        exit(EXIT_MISSING_ARG);
+    }
+
+    let rest = &args[2..];
+
+    match args[1].as_str() {
+        "serve" => {
+            let (host, port) = serve_flags(rest);
+            server::serve(host, port);
+        }
+        "daemon" => {
+            if args.len() < 3 {
+                die(
+                    EXIT_MISSING_ARG,
+                    "missing_argument",
+                    "daemon needs a subcommand: start, stop or status",
+                    &format!("{TOOL} daemon status"),
+                );
+            }
+            let sub = args[2].clone();
+            let (host, port) = serve_flags(&args[3..]);
+            match sub.as_str() {
+                "start" => daemon::start(&host, port),
+                "stop" => daemon::stop(port),
+                "status" => daemon::status(port),
+                _ => die(
+                    EXIT_UNKNOWN_COMMAND,
+                    "unknown_command",
+                    &format!("unknown daemon subcommand \"{sub}\""),
+                    &format!("{TOOL} daemon status"),
+                ),
+            }
+        }
+        "guide" => {
+            if has_flag(rest, "--human") {
+                println!("{}", guide::guide_markdown());
+            } else {
+                println!("{}", guide::guide_json());
+            }
+        }
+        "help-json" => println!("{}", guide::help_json()),
+        "version" => {
+            if has_flag(rest, "--json") {
+                println!("{{\"version\":\"{VERSION}\",\"name\":\"{TOOL}\"}}");
+            } else {
+                println!("{TOOL} v{VERSION}");
+            }
+        }
+        "help" | "--help" | "-h" => print_help(),
+
+        // Back-compat alias for the pre-spec command name.
+        "start" => {
+            let (host, port) = serve_flags(rest);
+            if has_flag(rest, "-daemon") || has_flag(rest, "--daemon") {
+                daemon::start(&host, port);
+            } else {
+                server::serve(host, port);
+            }
+        }
+        "stop" => {
+            let (_, port) = serve_flags(rest);
+            daemon::stop(port);
+        }
+        "status" => {
+            let (_, port) = serve_flags(rest);
+            daemon::status(port);
+        }
+
+        other => die(
+            EXIT_UNKNOWN_COMMAND,
+            "unknown_command",
+            &format!("unknown command \"{other}\""),
+            &format!("{TOOL} help-json"),
+        ),
+    }
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Start HTTP server with web UI
-    Start {
-        /// Port for HTTP server
-        #[arg(short, long, default_value_t = 8080)]
-        port: u16,
-    },
-    /// Show version information
-    Version,
-    /// Show help
-    Help,
-}
+/// Resolves `--host`/`--port`. The host default MUST be loopback
+/// (cli-daemon-spec §1): serving the whole network is a deliberate act, never
+/// something that happens because nobody passed a flag.
+fn serve_flags(args: &[String]) -> (String, u16) {
+    let host = flag_value(args, "--host")
+        .or_else(|| flag_value(args, "-host"))
+        .or_else(|| std::env::var("HOST").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
-// ─── State ──────────────────────────────────────────────────────
-#[derive(Clone)]
-struct AppState {
-    start_time: Instant,
-    port: u16,
-}
+    let port_str = flag_value(args, "--port")
+        .or_else(|| flag_value(args, "-port"))
+        .or_else(|| flag_value(args, "-p"))
+        .or_else(|| std::env::var("PORT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "8080".to_string());
 
-#[derive(Serialize)]
-struct StatusResponse {
-    status: String,
-    port: u16,
-    uptime: String,
-    version: String,
-    start_time: String,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
-}
-
-// ─── Handlers ───────────────────────────────────────────────────
-async fn serve_index() -> Html<&'static str> {
-    Html(INDEX_HTML)
-}
-
-async fn serve_app_js() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        APP_JS,
-    )
-        .into_response()
-}
-
-async fn serve_styles_css() -> Response {
-    (
-        [("content-type", "text/css")],
-        STYLES_CSS,
-    )
-        .into_response()
-}
-
-async fn serve_component_app_layout() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        COMPONENTS_APP_LAYOUT,
-    )
-        .into_response()
-}
-
-async fn serve_component_sidebar() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        COMPONENTS_SIDEBAR,
-    )
-        .into_response()
-}
-
-async fn serve_component_status_card() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        COMPONENTS_STATUS_CARD,
-    )
-        .into_response()
-}
-
-async fn serve_view_dashboard() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        VIEWS_DASHBOARD,
-    )
-        .into_response()
-}
-
-async fn serve_view_settings() -> Response {
-    (
-        [("content-type", "application/javascript")],
-        VIEWS_SETTINGS,
-    )
-        .into_response()
-}
-
-async fn serve_status(State(state): State<Arc<RwLock<AppState>>>) -> Json<StatusResponse> {
-    let state = state.read().await;
-    let elapsed = state.start_time.elapsed();
-    
-    let uptime = if elapsed.as_secs() >= 3600 {
-        format!("{}h{}m{}s", 
-            elapsed.as_secs() / 3600,
-            (elapsed.as_secs() % 3600) / 60,
-            elapsed.as_secs() % 60)
-    } else if elapsed.as_secs() >= 60 {
-        format!("{}m{}s", 
-            elapsed.as_secs() / 60,
-            elapsed.as_secs() % 60)
-    } else {
-        format!("{}s", elapsed.as_secs())
+    let port: u16 = match port_str.parse() {
+        Ok(p) => p,
+        Err(_) => die(
+            EXIT_MISSING_ARG,
+            "bad_flag_value",
+            &format!("--port must be a number, got \"{port_str}\""),
+            &format!("{TOOL} serve --port 8080"),
+        ),
     };
-    
-    Json(StatusResponse {
-        status: "running".to_string(),
-        port: state.port,
-        uptime,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        start_time: format!("{:?}", state.start_time.elapsed()),
-    })
+
+    (host, port)
 }
 
-async fn serve_health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+pub fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
 }
 
-// ─── Main ───────────────────────────────────────────────────────
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Start { port } => {
-            let state = Arc::new(RwLock::new(AppState {
-                start_time: Instant::now(),
-                port,
-            }));
-
-            let app = Router::new()
-                .route("/", get(serve_index))
-                .route("/css/styles.css", get(serve_styles_css))
-                .route("/js/app.js", get(serve_app_js))
-                .route("/js/components/AppLayout.js", get(serve_component_app_layout))
-                .route("/js/components/Sidebar.js", get(serve_component_sidebar))
-                .route("/js/components/StatusCard.js", get(serve_component_status_card))
-                .route("/js/views/Dashboard.js", get(serve_view_dashboard))
-                .route("/js/views/Settings.js", get(serve_view_settings))
-                .route("/api/status", get(serve_status))
-                .route("/api/health", get(serve_health))
-                .with_state(state);
-
-            let addr = format!("0.0.0.0:{}", port);
-            println!("Server starting on http://localhost:{}", port);
-            println!("UI available at http://localhost:{}/", port);
-            println!("API available at http://localhost:{}/api/status", port);
-            println!("Press Ctrl+C to stop");
-
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
+/// Reads `--name value` or `--name=value`.
+pub fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            return args.get(i + 1).cloned();
         }
-        Commands::Version => {
-            println!("boilerplate-cli-ui-rust v{}", env!("CARGO_PKG_VERSION"));
-        }
-        Commands::Help => {
-            println!("boilerplate-cli-ui-rust - Rust CLI with embedded web UI");
-            println!();
-            println!("Usage:");
-            println!("  boilerplate-cli-ui-rust <command> [options]");
-            println!();
-            println!("Commands:");
-            println!("  start       Start HTTP server with web UI");
-            println!("  version     Show version information");
-            println!("  help        Show this help message");
-            println!();
-            println!("Start Options:");
-            println!("  -p, --port <PORT>  Port for HTTP server (default 8080)");
-            println!();
-            println!("API Endpoints:");
-            println!("  GET /            Web UI");
-            println!("  GET /api/status  Server status (JSON)");
-            println!("  GET /api/health  Health check (JSON)");
+        if let Some(v) = a.strip_prefix(&prefix) {
+            return Some(v.to_string());
         }
     }
+    None
+}
+
+/// Emits a typed error on stdout and exits with the matching code. The exit
+/// status and `.error.code` are the same number by construction (§2, §3).
+pub fn die(code: i32, etype: &str, message: &str, suggestion: &str) -> ! {
+    let recoverable = (100..=109).contains(&code);
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "type": etype,
+            "message": message,
+            "recoverable": recoverable,
+            "suggestions": [suggestion],
+        }
+    });
+    println!("{body}");
+    exit(code);
+}
+
+/// Help is context, not the answer to a query, so it goes to stderr and stdout
+/// stays clean for data (cli-output-spec §1).
+fn print_help() {
+    eprintln!("{TOOL} - Rust CLI with an embedded web UI");
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!("  {TOOL} <command> [options]");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  serve [--host H] [--port N]   run the HTTP server in the foreground");
+    eprintln!("  daemon start [--port N]       start it in the background");
+    eprintln!("  daemon stop [--port N]        stop the background server");
+    eprintln!("  daemon status [--port N]      report background server status");
+    eprintln!("  guide [--human]               the embedded operator guide");
+    eprintln!("  help-json                     machine-readable command catalog");
+    eprintln!("  version [--json]              show version information");
+    eprintln!("  help                          show this help message");
+    eprintln!();
+    eprintln!("Endpoints:");
+    eprintln!("  GET  /            Web UI");
+    eprintln!("  GET  /api/status  Server status (JSON)");
+    eprintln!("  GET  /_health     Liveness: {{ok,service,pid}}");
+    eprintln!("  POST /_shutdown   Stop the server (token-gated off-loopback)");
+    eprintln!();
+    eprintln!("Exit codes: 0 ok, 80-89 input, 90-99 state, 100-109 external, 110-119 internal");
 }
